@@ -15,6 +15,13 @@ as a gate on the immutable merge result:
     candidate final document must pass. A partial batch leaves conflict
     placeholders in the document and is never checked. A failing final
     batch lists every violation and writes nothing.
+  * The two read-only previews — the explicit-resolution preview and the
+    draft preview — reuse the same final-batch gate. A preview that would
+    resolve the last conflict and whose candidate violates the schema
+    fails with that identical 422 error list instead of reporting a
+    would-resolve success, so a preview and the formal submission of the
+    same values can never disagree. The validation is pure: a rejected
+    preview writes nothing, and a partial preview is not validated.
 
 Everything here is pure and in-memory; the caller decides whether an
 outcome is persisted.

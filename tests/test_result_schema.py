@@ -389,3 +389,216 @@ def test_error_order_is_stable():
     paths = [(e["instance_path"], e["schema_path"]) for e in exc_info.value.errors]
     assert paths == sorted(paths)
     assert [p[0] for p in paths] == ["/a", "/z"]
+
+
+# ---------------------------------------------------------------------------
+# POST /merges/{id}/resolution-preview: the final-batch gate must apply
+# ---------------------------------------------------------------------------
+
+STRING_SCHEMA = {
+    "type": "object",
+    "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+}
+
+
+def test_resolution_preview_final_batch_validated_and_side_effect_free(client):
+    resp = _multi_conflict(client, STRING_SCHEMA)
+    mid = resp.json()["merge_id"]
+
+    # left/right candidates are integers: they would violate the schema.
+    batch = {
+        "revision": 1,
+        "resolutions": [
+            {"pointer": "/a", "choice": "left"},
+            {"pointer": "/b", "choice": "right"},
+        ],
+    }
+    resp = client.post(f"/merges/{mid}/resolution-preview", json=batch)
+    assert resp.status_code == 422, resp.text
+    body = resp.json()
+    assert body["detail"] == "final result does not satisfy result_schema"
+    assert [(e["instance_path"], e["schema_path"]) for e in body["errors"]] == [
+        ("/a", "/properties/a/type"),
+        ("/b", "/properties/b/type"),
+    ]
+    # No success-preview payload leaks through a rejected preview.
+    for field in ("document", "remaining_conflicts", "would_resolve",
+                  "patch", "result_sha256"):
+        assert field not in body
+
+    # Read-only: revision, status, conflicts and the audit chain are intact.
+    fetched = client.get(f"/merges/{mid}").json()
+    assert fetched["revision"] == 1
+    assert fetched["status"] == "pending"
+    assert sorted(c["pointer"] for c in fetched["conflicts"]) == ["/a", "/b"]
+    audit = client.get(f"/merges/{mid}/audit").json()
+    assert audit["event_count"] == 0
+    assert audit["chain_valid"] is True
+
+    # A compliant preview still succeeds with patch and digest.
+    ok = client.post(
+        f"/merges/{mid}/resolution-preview",
+        json={
+            "revision": 1,
+            "resolutions": [
+                {"pointer": "/a", "value": "x"},
+                {"pointer": "/b", "value": "y"},
+            ],
+        },
+    )
+    assert ok.status_code == 200, ok.text
+    preview = ok.json()
+    assert preview["would_resolve"] is True
+    assert preview["document"] == {"a": "x", "b": "y"}
+    assert preview["result_sha256"]
+
+    # The bad preview changed nothing: the same bad values submitted for
+    # real fail with the identical 422 error list.
+    real = client.post(f"/merges/{mid}/resolutions", json=batch)
+    assert real.status_code == 422
+    assert real.json()["errors"] == body["errors"]
+    assert client.get(f"/merges/{mid}").json()["revision"] == 1
+
+
+def test_resolution_preview_422_matches_commit_422_for_same_values(client):
+    resp = _multi_conflict(client, STRING_SCHEMA)
+    mid = resp.json()["merge_id"]
+    batch = {
+        "revision": 1,
+        "resolutions": [
+            {"pointer": "/a", "value": 5},
+            {"pointer": "/b", "value": 6},
+        ],
+    }
+    preview_resp = client.post(f"/merges/{mid}/resolution-preview", json=batch)
+    commit_resp = client.post(f"/merges/{mid}/resolutions", json=batch)
+    assert preview_resp.status_code == commit_resp.status_code == 422
+    assert preview_resp.json() == commit_resp.json()
+
+
+def test_resolution_preview_partial_batch_is_not_validated(client):
+    resp = _multi_conflict(client, STRING_SCHEMA)
+    mid = resp.json()["merge_id"]
+
+    # /a becomes an integer (schema violation), but /b stays open.
+    resp = client.post(
+        f"/merges/{mid}/resolution-preview",
+        json={"revision": 1,
+              "resolutions": [{"pointer": "/a", "choice": "left"}]},
+    )
+    assert resp.status_code == 200, resp.text
+    preview = resp.json()
+    assert preview["would_resolve"] is False
+    assert [c["pointer"] for c in preview["remaining_conflicts"]] == ["/b"]
+    assert "patch" not in preview and "result_sha256" not in preview
+    # Partial preview is read-only too.
+    assert client.get(f"/merges/{mid}").json()["revision"] == 1
+
+
+def test_resolution_preview_without_schema_unchanged(client):
+    # A merge without result_schema previews exactly as before.
+    resp = _multi_conflict(client, None)
+    mid = resp.json()["merge_id"]
+    resp = client.post(
+        f"/merges/{mid}/resolution-preview",
+        json={
+            "revision": 1,
+            "resolutions": [
+                {"pointer": "/a", "choice": "left"},
+                {"pointer": "/b", "choice": "right"},
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    preview = resp.json()
+    assert preview["would_resolve"] is True
+    assert preview["document"] == {"a": 2, "b": 3}
+    assert preview["patch"]
+
+
+# ---------------------------------------------------------------------------
+# GET /merges/{id}/drafts/{draft_id}/preview: the same gate must apply
+# ---------------------------------------------------------------------------
+
+
+def test_draft_preview_final_batch_validated_and_side_effect_free(client):
+    resp = _multi_conflict(client, STRING_SCHEMA)
+    mid = resp.json()["merge_id"]
+    did = client.post(f"/merges/{mid}/drafts").json()["draft_id"]
+    client.post(
+        f"/merges/{mid}/drafts/{did}/resolutions",
+        json={
+            "resolutions": [
+                {"pointer": "/a", "choice": "left"},
+                {"pointer": "/b", "choice": "right"},
+            ]
+        },
+    )
+
+    # Completing the draft with violating values -> 422, no preview body.
+    resp = client.get(f"/merges/{mid}/drafts/{did}/preview")
+    assert resp.status_code == 422, resp.text
+    body = resp.json()
+    assert body["detail"] == "final result does not satisfy result_schema"
+    assert [(e["instance_path"], e["schema_path"]) for e in body["errors"]] == [
+        ("/a", "/properties/a/type"),
+        ("/b", "/properties/b/type"),
+    ]
+    for field in ("document", "remaining_conflicts", "would_resolve",
+                  "patch", "result_sha256"):
+        assert field not in body
+
+    # Read-only: the merge and the draft (still open, values preserved)
+    # are untouched, and no audit event was appended.
+    fetched = client.get(f"/merges/{mid}").json()
+    assert fetched["revision"] == 1
+    assert fetched["status"] == "pending"
+    assert sorted(c["pointer"] for c in fetched["conflicts"]) == ["/a", "/b"]
+    draft = client.get(f"/merges/{mid}/drafts/{did}").json()
+    assert draft["status"] == "open"
+    assert sorted(i["pointer"] for i in draft["resolutions"]) == ["/a", "/b"]
+    assert client.get(f"/merges/{mid}/audit").json()["event_count"] == 0
+
+    # Committing the same draft yields the identical 422 error list.
+    commit = client.post(f"/merges/{mid}/drafts/{did}/commit")
+    assert commit.status_code == 422
+    assert commit.json()["errors"] == body["errors"]
+    assert client.get(f"/merges/{mid}/drafts/{did}").json()["status"] == "open"
+
+    # Fix the draft: the preview passes with patch and digest.
+    client.post(
+        f"/merges/{mid}/drafts/{did}/resolutions",
+        json={
+            "resolutions": [
+                {"pointer": "/a", "value": "x"},
+                {"pointer": "/b", "value": "y"},
+            ]
+        },
+    )
+    ok = client.get(f"/merges/{mid}/drafts/{did}/preview")
+    assert ok.status_code == 200, ok.text
+    preview = ok.json()
+    assert preview["would_resolve"] is True
+    assert preview["document"] == {"a": "x", "b": "y"}
+    assert preview["result_sha256"]
+    assert preview["patch"]
+
+
+def test_draft_preview_partial_draft_is_not_validated(client):
+    resp = _multi_conflict(client, STRING_SCHEMA)
+    mid = resp.json()["merge_id"]
+    did = client.post(f"/merges/{mid}/drafts").json()["draft_id"]
+    client.post(
+        f"/merges/{mid}/drafts/{did}/resolutions",
+        json={"resolutions": [{"pointer": "/a", "choice": "left"}]},
+    )
+
+    resp = client.get(f"/merges/{mid}/drafts/{did}/preview")
+    assert resp.status_code == 200, resp.text
+    preview = resp.json()
+    assert preview["would_resolve"] is False
+    assert [c["pointer"] for c in preview["remaining_conflicts"]] == ["/b"]
+    assert "patch" not in preview and "result_sha256" not in preview
+    # The merge was not touched by the preview.
+    assert client.get(f"/merges/{mid}").json()["revision"] == 1
+
