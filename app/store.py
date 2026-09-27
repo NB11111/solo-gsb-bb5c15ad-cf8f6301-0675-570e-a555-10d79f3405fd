@@ -460,8 +460,12 @@ def preview_resolutions(
 
     Same revision/status guards and per-item validation as
     apply_resolutions, but stricter: an item carrying both 'choice' and
-    'value' is rejected. Nothing is persisted — no write, no revision
-    bump, no status change.
+    'value' is rejected. A batch that would resolve the last conflict is
+    also checked against the merge's result_schema with the same
+    validate_result call the commit path uses, so a candidate the real
+    submission would reject (422) fails the preview identically instead of
+    reporting a false would_resolve. Nothing is persisted — no write, no
+    revision bump, no status change.
     """
     row = db.query_one("SELECT * FROM merges WHERE id = ?", (merge_id,))
     if row is None:
@@ -481,6 +485,16 @@ def preview_resolutions(
         json.loads(row["document"]), json.loads(row["conflicts"]), resolutions
     )
     would_resolve = not remaining
+    if would_resolve and row["result_schema"] is not None:
+        # Same Draft 2020-12 gate as the committing endpoint: a batch that
+        # would resolve the last conflict must yield a final document
+        # satisfying result_schema, otherwise the preview fails with the
+        # very 422 error list the real submission would return instead of
+        # falsely reporting would_resolve. A partial batch (conflicts
+        # remain) is never validated, exactly like a partial commit. The
+        # preview writes nothing either way, so a failed gate leaves the
+        # merge, its drafts and the audit trail untouched.
+        validate_result(json.loads(row["result_schema"]), document)
     preview = {
         "merge_id": merge_id,
         "revision": row["revision"],
@@ -793,7 +807,10 @@ def preview_draft(merge_id: str, draft_id: str) -> dict:
     Nothing is written. Returns the would-be document and the conflicts
     still open after the draft (pointers may be filled in over several
     edits, so a partial draft simply reports the rest); when the draft
-    would resolve everything, the deterministic base-to-result patch and
+    would resolve everything, the candidate final document is checked
+    against the merge's result_schema with the same validate_result call
+    the commit uses — a draft the commit would reject (422) fails the
+    preview identically — and the deterministic base-to-result patch and
     its SHA-256 are included, mirroring the resolution-preview endpoint.
     """
     merge_row, draft_row = _get_draft_rows(merge_id, draft_id)
@@ -805,6 +822,16 @@ def preview_draft(merge_id: str, draft_id: str) -> dict:
         _stored_to_batch(json.loads(draft_row["resolutions"])),
     )
     would_resolve = not remaining
+    if would_resolve and merge_row["result_schema"] is not None:
+        # Same Draft 2020-12 gate as the draft commit: a draft that would
+        # resolve the last conflict must yield a final document satisfying
+        # result_schema, otherwise the preview fails with the very 422
+        # error list the commit would return instead of falsely reporting
+        # would_resolve. A partial draft is never validated, exactly like
+        # a partial commit. The preview writes nothing either way, so a
+        # failed gate leaves the merge, the draft and the audit trail
+        # untouched.
+        validate_result(json.loads(merge_row["result_schema"]), document)
     preview = {
         "merge_id": merge_id,
         "draft_id": draft_id,

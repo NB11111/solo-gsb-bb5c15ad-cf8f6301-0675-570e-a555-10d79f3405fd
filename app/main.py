@@ -348,8 +348,11 @@ def preview_resolution(merge_id: str, body: ResolveRequest):
     validated and applied on an in-memory copy only: nothing is written,
     the revision is not bumped and the status never changes. Returns the
     would-be document and remaining conflicts; when the batch would
-    resolve everything, the deterministic base-to-result patch and its
-    SHA-256 are included.
+    resolve everything, the candidate final document must pass the merge's
+    result_schema gate exactly as in the committing endpoint — a violation
+    yields the same 422 error list instead of a success preview — and only
+    then are the deterministic base-to-result patch and its SHA-256
+    included.
     """
     return store.preview_resolutions(merge_id, body.revision, _resolution_items(body))
 
@@ -453,7 +456,10 @@ def preview_draft(merge_id: str, draft_id: str):
 
     Nothing is written. Returns the would-be document and the conflicts
     still open after the draft; when the draft would resolve everything,
-    the deterministic base-to-result patch and its SHA-256 are included.
+    the candidate final document must pass the merge's result_schema gate
+    exactly as in the draft commit — a violation yields the same 422 error
+    list instead of a success preview — and only then are the
+    deterministic base-to-result patch and its SHA-256 included.
     """
     return store.preview_draft(merge_id, draft_id)
 

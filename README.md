@@ -68,14 +68,14 @@ EVIDENCE_HMAC_KEY=<至少 32 字节的随机密钥> docker compose up --build
 | `POST` | `/merges` | 提交 base/left/right，创建合并单（支持幂等键、可选 `result_schema` 门禁） |
 | `GET` | `/merges/{merge_id}` | 状态查询：状态、revision、剩余冲突、最终结果 |
 | `POST` | `/merges/{merge_id}/resolutions` | 携带 revision 分批提交冲突取值（最后一批须通过 schema 门禁） |
-| `POST` | `/merges/{merge_id}/resolution-preview` | 预演冲突解决：内存副本上校验并应用，不落库、不改状态 |
+| `POST` | `/merges/{merge_id}/resolution-preview` | 预演冲突解决：内存副本上校验并应用，不落库、不改状态；消除最后一个冲突时与正式提交一样过 `result_schema` 门禁（违规同样返回 422） |
 | `POST` | `/merges/{merge_id}/rule-resolutions` | 携带 revision 与有序路径规则，按模式批量裁决冲突（最后一批须通过门禁） |
 | `POST` | `/merges/{merge_id}/reuse-resolutions` | 从一个已 resolved 的历史合并单按指针复用裁决，原子应用全部匹配项 |
 | `POST` | `/merges/{merge_id}/resolution-undo` | 撤销最近一批仍生效的裁决：从初始快照重放重建，revision +1 |
 | `POST` | `/merges/{merge_id}/drafts` | 为待处理合并单创建解决草案（固定创建时的 revision） |
 | `GET` | `/merges/{merge_id}/drafts/{draft_id}` | 查看草案：状态、钉住的 base_revision、已累积的取值 |
 | `POST` | `/merges/{merge_id}/drafts/{draft_id}/resolutions` | 向草案追加或覆盖冲突取值（只改草案，不改合并单） |
-| `GET` | `/merges/{merge_id}/drafts/{draft_id}/preview` | 草案预演：应用草案后的文档与剩余冲突，不落库 |
+| `GET` | `/merges/{merge_id}/drafts/{draft_id}/preview` | 草案预演：应用草案后的文档与剩余冲突，不落库；消除最后一个冲突时与草案提交一样过 `result_schema` 门禁（违规同样返回 422） |
 | `POST` | `/merges/{merge_id}/drafts/{draft_id}/commit` | 单事务提交草案：重校验后一次性应用全部取值并使草案失效 |
 | `GET` | `/merges/{merge_id}/patch` | resolved 后：base → result 的 RFC 6902 补丁（含 SHA-256） |
 | `GET` | `/merges/{merge_id}/audit` | 裁决审计链：按序返回全部裁决事件及逐合并单 SHA-256 链校验结果 |
@@ -252,6 +252,7 @@ curl -s -X POST http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/re
 ```
 
 - `would_resolve` 为 `true`（该批次可解决全部剩余冲突）时，额外返回 `base` → 预演结果的确定性 `patch`（规则同 `GET /merges/{merge_id}/patch`）与 `result_sha256`；否则不携带这两个字段。
+- **`result_schema` 门禁与正式提交一致**：仅当该批次将消除最后一个冲突（`would_resolve` 为 `true`）且合并单带有 `result_schema` 时，预演会用与正式提交完全相同的 Draft 2020-12 校验检查候选结果；违规 → 与正式提交相同的 **`422`** 错误列表（按 `instance_path`、`schema_path` 稳定排序），且**不返回成功预演结果**（无 `document` / `would_resolve` / `patch`）。仍有冲突剩余的部分预演不提前校验，照常返回部分预演结果。预演全程只读：无论通过与否，合并单的 `revision`、状态、冲突列表、草案与审计记录均不受影响。
 - 任一指针对应的冲突不存在或已在本批中被解决（即指针重复）、或同一条目同时给出 `choice` 与 `value`（显式 `null` 也算给出 `value`）→ 整批 **`400`**，同样无任何副作用。
 - `revision` 过期、合并单已 `resolved` → 与正式提交相同的 **`409`**；合并单不存在 → **`404`**。
 
@@ -466,7 +467,7 @@ curl -s -X POST http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/dr
 ```
 
 - **编辑语义复用 resolutions**：每条取值二选一 `choice` / `value`（显式 `null` 算给出 `value`；两者同给或都不给 → `400`）；未知冲突指针 → `400`（`no open conflict at pointer …`）。编辑只更新草案行，合并单的 `revision`、`conflicts`、`document` 均不受影响。
-- **预演无副作用**：基于草案创建时的快照计算，不写入、不改状态；`would_resolve` 为 `true` 时附确定性 `patch` 与 `result_sha256`（规则同 `resolution-preview`）。`current_revision` 与 `base_revision` 不一致时说明合并单已被其他请求推进，提交将返回 `409`。
+- **预演无副作用**：基于草案创建时的快照计算，不写入、不改状态；`would_resolve` 为 `true` 时附确定性 `patch` 与 `result_sha256`（规则同 `resolution-preview`）。**`result_schema` 门禁与草案提交一致**：草案将消除最后一个冲突且合并单带有 `result_schema` 时，预演会用与提交完全相同的 Draft 2020-12 校验检查候选结果，违规 → 相同的 **`422`** 错误列表且不返回成功预演结果；仍有冲突剩余的部分预演不提前校验。无论通过与否，合并单状态、`revision`、草案内容与审计记录均不受影响。`current_revision` 与 `base_revision` 不一致时说明合并单已被其他请求推进，提交将返回 `409`。
 - **提交是原子操作**：在**单个事务**内重读合并单并重新校验——① 草案仍为 `open`；② 合并单仍 `pending`；③ 当前 `revision` 等于草案的 `base_revision`；④ 草案覆盖的每个指针仍是开放冲突；⑤ 若草案将解决最后一个冲突，候选结果须通过 `result_schema` 门禁。全部通过才**一次性应用全部取值**（`revision` 恰好 +1）并将草案置为 `committed`；任一条件变化 → **`409`**（revision 过期时响应体携带 `current_revision`；schema 不通过 → 复用 `422` 错误列表），**合并单与草案内容均不部分写入**（草案保持 `open`、取值原样保留，可修正后重试或放弃）。
 - **部分草案也可提交**：未覆盖的冲突原样保留，合并单继续 `pending`（与分批 resolutions 语义一致）；空草案（无任何取值）提交 → `400`。
 - 合并单已 `resolved` → 创建草案与提交草案均 `409`；合并单或草案不存在 → `404`（草案不能跨合并单 URL 访问）。
@@ -792,7 +793,7 @@ pip install -r requirements.txt
 pip install httpx pytest
 export EVIDENCE_HMAC_KEY=<至少 32 字节的密钥>   # 证据包签名密钥，缺失或过短无法启动
 uvicorn app.main:app --reload --port 8000   # 本地运行
-python -m pytest tests/ -q                  # 运行测试（230 项）
+python -m pytest tests/ -q                  # 运行测试（246 项）
 ```
 
 ## 项目结构

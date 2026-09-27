@@ -5,6 +5,9 @@ schema itself is validated on creation (422, no record), conflict-free
 merges must satisfy it, and only a batch resolving the *last* open
 conflict is checked for both explicit and rule-based resolutions — with
 all violations reported in a stable order and no write / revision bump.
+Both dry-run endpoints (resolution-preview and the draft preview) apply
+that same final gate, so a candidate the commit would reject never
+reports a false would_resolve.
 """
 
 import os
@@ -389,3 +392,215 @@ def test_error_order_is_stable():
     paths = [(e["instance_path"], e["schema_path"]) for e in exc_info.value.errors]
     assert paths == sorted(paths)
     assert [p[0] for p in paths] == ["/a", "/z"]
+
+
+# ---------------------------------------------------------------------------
+# POST /merges/{id}/resolution-preview: the final gate applies to dry-runs
+# ---------------------------------------------------------------------------
+
+
+def test_resolution_preview_final_batch_validated_like_commit(client):
+    schema = {
+        "type": "object",
+        "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+        "required": ["a", "b"],
+    }
+    resp = _multi_conflict(client, schema)
+    mid = resp.json()["merge_id"]
+    violating = [
+        {"pointer": "/a", "choice": "left"},
+        {"pointer": "/b", "choice": "right"},
+    ]
+
+    # The dry-run resolves the last conflict with values that violate the
+    # schema: the same 422 the committing endpoint returns, and no
+    # successful preview result (no document / would_resolve / patch).
+    resp = client.post(
+        f"/merges/{mid}/resolution-preview",
+        json={"revision": 1, "resolutions": violating},
+    )
+    assert resp.status_code == 422, resp.text
+    body = resp.json()
+    assert body["detail"] == "final result does not satisfy result_schema"
+    assert "would_resolve" not in body and "patch" not in body
+    assert [(e["instance_path"], e["schema_path"]) for e in body["errors"]] == [
+        ("/a", "/properties/a/type"),
+        ("/b", "/properties/b/type"),
+    ]
+
+    # The failed preview is side-effect free: revision, status, conflicts
+    # and the audit trail are all unchanged.
+    fetched = client.get(f"/merges/{mid}").json()
+    assert fetched["revision"] == 1
+    assert fetched["status"] == "pending"
+    assert sorted(c["pointer"] for c in fetched["conflicts"]) == ["/a", "/b"]
+    audit = client.get(f"/merges/{mid}/audit").json()
+    assert audit["event_count"] == 0 and audit["events"] == []
+
+    # Submitting the same values for real fails with the identical 422.
+    resp = client.post(
+        f"/merges/{mid}/resolutions",
+        json={"revision": 1, "resolutions": violating},
+    )
+    assert resp.status_code == 422
+    assert resp.json()["errors"] == body["errors"]
+    assert client.get(f"/merges/{mid}").json()["revision"] == 1
+
+    # A compliant batch previews successfully: patch and digest correspond
+    # to the candidate result, and the merge is still untouched.
+    compliant = [
+        {"pointer": "/a", "value": "x"},
+        {"pointer": "/b", "value": "y"},
+    ]
+    resp = client.post(
+        f"/merges/{mid}/resolution-preview",
+        json={"revision": 1, "resolutions": compliant},
+    )
+    assert resp.status_code == 200, resp.text
+    preview = resp.json()
+    assert preview["would_resolve"] is True
+    assert preview["document"] == {"a": "x", "b": "y"}
+    from app.patch import sha256_hex
+    from tests.patch_apply import apply_patch
+
+    assert preview["result_sha256"] == sha256_hex(preview["document"])
+    assert apply_patch({"a": 1, "b": 1}, preview["patch"]) == preview["document"]
+    assert client.get(f"/merges/{mid}").json()["revision"] == 1
+
+    # ...and the same batch then commits for real against the same revision.
+    resp = client.post(
+        f"/merges/{mid}/resolutions",
+        json={"revision": 1, "resolutions": compliant},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["result"] == preview["document"]
+
+
+def test_resolution_preview_partial_batch_not_validated(client):
+    resp = _multi_conflict(
+        client,
+        {"type": "object",
+         "properties": {"a": {"type": "string"}, "b": {"type": "string"}}},
+    )
+    mid = resp.json()["merge_id"]
+
+    # /a becomes the integer 2, which violates the schema — but the batch
+    # leaves /b open, so the preview is not validated, exactly like a
+    # partial committing batch.
+    resp = client.post(
+        f"/merges/{mid}/resolution-preview",
+        json={"revision": 1, "resolutions": [{"pointer": "/a", "choice": "left"}]},
+    )
+    assert resp.status_code == 200, resp.text
+    preview = resp.json()
+    assert preview["would_resolve"] is False
+    assert preview["document"] == {"a": 2, "b": {"__merge_conflict__": "/b"}}
+    assert [c["pointer"] for c in preview["remaining_conflicts"]] == ["/b"]
+    assert "patch" not in preview and "result_sha256" not in preview
+    assert client.get(f"/merges/{mid}").json()["revision"] == 1
+
+
+# ---------------------------------------------------------------------------
+# GET /merges/{id}/drafts/{id}/preview: the final gate applies to dry-runs
+# ---------------------------------------------------------------------------
+
+
+def _create_draft(client, merge_id):
+    resp = client.post(f"/merges/{merge_id}/drafts")
+    assert resp.status_code == 201, resp.text
+    return resp.json()["draft_id"]
+
+
+def _update_draft(client, merge_id, draft_id, resolutions):
+    resp = client.post(
+        f"/merges/{merge_id}/drafts/{draft_id}/resolutions",
+        json={"resolutions": resolutions},
+    )
+    assert resp.status_code == 200, resp.text
+
+
+def test_draft_preview_final_batch_validated_like_commit(client):
+    schema = {
+        "type": "object",
+        "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+        "required": ["a", "b"],
+    }
+    resp = _multi_conflict(client, schema)
+    mid = resp.json()["merge_id"]
+    did = _create_draft(client, mid)
+    _update_draft(
+        client, mid, did,
+        [{"pointer": "/a", "choice": "left"}, {"pointer": "/b", "choice": "right"}],
+    )
+
+    # The draft resolves the last conflict with values that violate the
+    # schema: the same 422 the draft commit returns, and no successful
+    # preview result.
+    resp = client.get(f"/merges/{mid}/drafts/{did}/preview")
+    assert resp.status_code == 422, resp.text
+    body = resp.json()
+    assert body["detail"] == "final result does not satisfy result_schema"
+    assert "would_resolve" not in body and "patch" not in body
+    assert [(e["instance_path"], e["schema_path"]) for e in body["errors"]] == [
+        ("/a", "/properties/a/type"),
+        ("/b", "/properties/b/type"),
+    ]
+
+    # The failed preview is side-effect free: the merge, the draft (still
+    # open, resolutions intact) and the audit trail are all unchanged.
+    fetched = client.get(f"/merges/{mid}").json()
+    assert fetched["revision"] == 1 and fetched["status"] == "pending"
+    draft = client.get(f"/merges/{mid}/drafts/{did}").json()
+    assert draft["status"] == "open"
+    assert len(draft["resolutions"]) == 2
+    audit = client.get(f"/merges/{mid}/audit").json()
+    assert audit["event_count"] == 0 and audit["events"] == []
+
+    # Committing the same draft fails with the identical 422 error list.
+    resp = client.post(f"/merges/{mid}/drafts/{did}/commit")
+    assert resp.status_code == 422
+    assert resp.json()["errors"] == body["errors"]
+    assert client.get(f"/merges/{mid}/drafts/{did}").json()["status"] == "open"
+
+    # Fix the draft: the preview passes with patch and digest matching the
+    # candidate result, and the commit then succeeds.
+    _update_draft(
+        client, mid, did,
+        [{"pointer": "/a", "value": "x"}, {"pointer": "/b", "value": "y"}],
+    )
+    resp = client.get(f"/merges/{mid}/drafts/{did}/preview")
+    assert resp.status_code == 200, resp.text
+    preview = resp.json()
+    assert preview["would_resolve"] is True
+    assert preview["document"] == {"a": "x", "b": "y"}
+    from app.patch import sha256_hex
+    from tests.patch_apply import apply_patch
+
+    assert preview["result_sha256"] == sha256_hex(preview["document"])
+    assert apply_patch({"a": 1, "b": 1}, preview["patch"]) == preview["document"]
+
+    resp = client.post(f"/merges/{mid}/drafts/{did}/commit")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["result"] == preview["document"]
+
+
+def test_draft_preview_partial_draft_not_validated(client):
+    resp = _multi_conflict(
+        client,
+        {"type": "object",
+         "properties": {"a": {"type": "string"}, "b": {"type": "string"}}},
+    )
+    mid = resp.json()["merge_id"]
+    did = _create_draft(client, mid)
+    # /a becomes the integer 2, which violates the schema — but /b is still
+    # open, so the preview is not validated, exactly like a partial commit.
+    _update_draft(client, mid, did, [{"pointer": "/a", "choice": "left"}])
+
+    resp = client.get(f"/merges/{mid}/drafts/{did}/preview")
+    assert resp.status_code == 200, resp.text
+    preview = resp.json()
+    assert preview["would_resolve"] is False
+    assert preview["document"] == {"a": 2, "b": {"__merge_conflict__": "/b"}}
+    assert [c["pointer"] for c in preview["remaining_conflicts"]] == ["/b"]
+    assert "patch" not in preview and "result_sha256" not in preview
+    assert client.get(f"/merges/{mid}").json()["revision"] == 1
